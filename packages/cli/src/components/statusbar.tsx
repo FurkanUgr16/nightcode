@@ -1,13 +1,15 @@
-import { TextAttributes } from "@opentui/core";
+import { TextAttributes } from '@opentui/core'
+import { useTheme } from '../providers/theme'
 
 export function StatusBar() {
+  const { colors } = useTheme()
   return (
     <box flexDirection="row" gap={1}>
-      <text fg={"cyan"}>Build</text>
-      <text attributes={TextAttributes.DIM} fg={"gray"}>
-        {"\u203A"}
+      <text fg={colors.primary}>Build</text>
+      <text attributes={TextAttributes.DIM} fg={colors.dimSeparator}>
+        {'\u203A'}
       </text>
       <text>opus-4-6</text>
     </box>
-  );
+  )
 }
