@@ -14,14 +14,17 @@
     "@nightcode/server": "workspace:*"
   },
   "dependencies": {
+    "@nightcode/database": "workspace:*",
+    "@nightcode/shared": "workspace:*",
     "@opentui/core": "^0.5.11",
     "@opentui/react": "^0.5.11",
+    "eventsource-parser": "^4.1.1",
     "hono": "^4.13.8",
     "opentui-spinner": "^0.0.7",
+    "pretty-ms": "^9.3.1",
     "react": "^19.2.8",
     "react-router": "^8.4.0",
-    "zod": "^4.6.5",
-    "@nightcode/shared": "workspace:*"
+    "zod": "^4.6.5"
   },
   "engines": {
     "bun": ">=1.3.0"
