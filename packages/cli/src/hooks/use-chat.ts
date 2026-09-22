@@ -145,7 +145,7 @@ export function useChat(sessionId: string, initialMessages: Message[]) {
         },
       ])
     },
-    [],
+    [updateMessages],
   )
 
   const handelStream = useCallback(
