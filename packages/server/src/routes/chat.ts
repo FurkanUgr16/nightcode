@@ -2,11 +2,19 @@ import { Hono } from 'hono'
 import { streamSSE, streamText } from 'hono/streaming'
 import { zValidator } from '@hono/zod-validator'
 import { z } from 'zod'
-import { streamText as aiStreamText } from 'ai'
+import { streamText as aiStreamText, stepCountIs } from 'ai'
 import { db } from '@nightcode/database'
 import { Mode, MessageStatus } from '@nightcode/database/enums'
-import type { ChatStreamEvent } from '@nightcode/shared'
+import {
+  type ChatStreamEvent,
+  type MessagePart,
+  toolCallArgsSchema,
+  messagePartSchema,
+} from '@nightcode/shared'
 import { isSupportedChatModel, resolveChatModel } from '../lib/models'
+import type { Prisma } from '@nightcode/database'
+import { createTools } from '../tools'
+import { buildSystemPrompt } from '../system-prompt'
 
 const submitSchema = z.object({
   content: z.string(),
@@ -60,22 +68,32 @@ type StreamParams = {
   history: { role: 'user' | 'assistant'; content: string }[]
   mode: Mode
   abortController: AbortController
+  cwd: string | null
 }
 
 async function streamAIResponse(
   stream: Parameters<Parameters<typeof streamSSE>[1]>[0],
   params: StreamParams,
 ) {
-  const { sessionId, model, history, mode, abortController } = params
+  const { sessionId, model, history, mode, abortController, cwd } = params
+  const tools = cwd ? createTools(cwd, mode) : undefined
   const startTime = Date.now()
+  const parts: MessagePart[] = []
 
   const resolvedModel = resolveChatModel(model)
-  let fullText = ''
 
   const persistInterruptedMessage = async () => {
-    if (fullText.length === 0) return
+    const fullText = parts
+      .filter((p) => p.type === 'text')
+      .map((p) => p.text)
+      .join('')
+
+    if (fullText.length === 0 && parts.length === 0) return
 
     const elapsedMs = Date.now() - startTime
+
+    const validatedParts: Prisma.InputJsonValue | undefined =
+      parts.length > 0 ? messagePartSchema.parse(parts) : undefined
 
     await db.message.create({
       data: {
@@ -86,6 +104,7 @@ async function streamAIResponse(
         content: fullText,
         mode,
         duration: Math.round(elapsedMs / 1000),
+        parts: validatedParts,
       },
     })
   }
@@ -93,18 +112,90 @@ async function streamAIResponse(
   try {
     const result = aiStreamText({
       model: resolvedModel.model,
+      system: buildSystemPrompt({ cwd, mode }),
+      tools,
+      stopWhen: tools ? stepCountIs(50) : undefined,
       messages: history,
       abortSignal: abortController.signal,
+      providerOptions: resolvedModel.providerOptions,
     })
 
     for await (const part of result.stream) {
       if (stream.aborted) break
+      if (part.type === 'reasoning-delta') {
+        const last = parts[parts.length - 1]
+        if (last && last.type === 'reasoning') {
+          last.text += part.text
+        } else {
+          parts.push({ type: 'reasoning', text: part.text })
+        }
+        const event: ChatStreamEvent = {
+          type: 'reasoning-delta',
+          text: part.text,
+        }
+
+        await stream.writeSSE({
+          event: 'reasoning-delta',
+          data: JSON.stringify(event),
+        })
+      }
 
       if (part.type === 'text-delta') {
-        fullText += part.text
+        const last = parts[parts.length - 1]
+        if (last && last.type === 'text') {
+          last.text += part.text
+        } else {
+          parts.push({ type: 'text', text: part.text })
+        }
+
         const event: ChatStreamEvent = { type: 'text-delta', text: part.text }
         await stream.writeSSE({
           event: 'text-delta',
+          data: JSON.stringify(event),
+        })
+      }
+
+      if (part.type === 'tool-call') {
+        const args = toolCallArgsSchema.parse(part.input)
+
+        parts.push({
+          type: 'tool-call',
+          id: part.toolCallId,
+          name: part.toolName,
+          args,
+        })
+
+        const event: ChatStreamEvent = {
+          args,
+          type: 'tool-call',
+          toolCallId: part.toolCallId,
+          toolName: part.toolName,
+        }
+        await stream.writeSSE({ id: 'tool-call', data: JSON.stringify(event) })
+      }
+
+      if (part.type === 'tool-result') {
+        const resultStr =
+          typeof part.output === 'string'
+            ? part.output
+            : JSON.stringify(part.output)
+
+        const tcPart = parts.find(
+          (p): p is Extract<MessagePart, { type: 'tool-call' }> =>
+            p.type === 'tool-call' && p.id === part.toolCallId,
+        )
+
+        if (tcPart) {
+          tcPart.result = resultStr
+        }
+
+        const event: ChatStreamEvent = {
+          type: 'tool-result',
+          toolCallId: part.toolCallId,
+          result: resultStr,
+        }
+        await stream.writeSSE({
+          id: 'tool-result',
           data: JSON.stringify(event),
         })
       }
@@ -118,6 +209,13 @@ async function streamAIResponse(
     }
 
     const elapsedMs = Date.now() - startTime
+    const fullText = parts
+      .filter((p) => p.type === 'text')
+      .map((p) => p.text)
+      .join('')
+
+    const validatedParts: Prisma.InputJsonValue | undefined =
+      parts.length > 0 ? messagePartSchema.parse(parts) : undefined
 
     const assistantMessage = await db.message.create({
       data: {
@@ -128,6 +226,7 @@ async function streamAIResponse(
         content: fullText,
         mode,
         duration: Math.round(elapsedMs / 1000),
+        parts: validatedParts,
       },
     })
 
@@ -218,6 +317,7 @@ const app = new Hono()
           })
           try {
             await streamAIResponse(stream, {
+              cwd: session.cwd,
               abortController,
               history,
               mode: resumableMessage.mode,
@@ -290,6 +390,7 @@ const app = new Hono()
         })
 
         await streamAIResponse(stream, {
+          cwd: session.cwd,
           sessionId,
           model: data.model,
           history,
